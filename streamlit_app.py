@@ -351,7 +351,7 @@ if run_button:
                 f"${stats['max_value']:,.0f}",
                 f"${stats['std_dev']:,.0f}"
             )
-        }
+        
         
         st.table(stats_data)
         
