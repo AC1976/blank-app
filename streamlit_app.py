@@ -1,21 +1,14 @@
 import streamlit as st
-
-import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-import io
-import base64
-from matplotlib.backends.backend_pdf import PdfPages
-import sys
-
-# Import the simulator classes (assumes the main code is in a file called portfolio_simulator.py)
-# If running as standalone, include all the classes from the previous artifact here
-# For this example, I'll include the essential classes inline
-
 from dataclasses import dataclass
-from typing import Literal, Optional, List, Tuple
+from typing import Optional, List, Tuple
 from enum import Enum
 
+
+# ============================================================================
+# CORE SIMULATION CLASSES
+# ============================================================================
 
 class ContributionFrequency(Enum):
     """Enum for contribution frequencies"""
@@ -115,16 +108,301 @@ class TaxLot:
         self.total_cost_basis = shares * cost_basis_per_share
 
 
-# Note: Include the full PortfolioMonteCarloSimulator class here from the previous artifact
-# For brevity in this response, I'm showing the structure - you'll need to copy the full class
-
 class PortfolioMonteCarloSimulator:
-    """Monte Carlo simulator - COPY FULL CLASS FROM PREVIOUS ARTIFACT"""
-    # [Copy entire class implementation here]
-    pass
+    """
+    Monte Carlo simulator for portfolio planning with regular contributions and taxation.
+    """
+    
+    def __init__(
+        self,
+        index_params: IndexParameters,
+        initial_investment: float,
+        regular_contribution: float,
+        contribution_frequency: ContributionFrequency,
+        years: int,
+        num_simulations: int = 1000,
+        tax_model: TaxModel = TaxModel.NONE,
+        tax_settings: Optional[TaxSettings] = None,
+        random_seed: Optional[int] = None
+    ):
+        self.index_params = index_params
+        self.initial_investment = initial_investment
+        self.regular_contribution = regular_contribution
+        self.contribution_frequency = contribution_frequency
+        self.years = years
+        self.num_simulations = num_simulations
+        self.tax_model = tax_model
+        self.tax_settings = tax_settings
+        self.random_seed = random_seed
+        
+        if tax_model != TaxModel.NONE and tax_settings is None:
+            raise ValueError("tax_settings required when using a tax model")
+        
+        self.months = years * 12
+        self.contribution_months = self._get_contribution_months()
+        
+        self.portfolio_paths = None
+        self.final_values = None
+        self.total_taxes_paid = None
+        
+    def _get_contribution_months(self) -> np.ndarray:
+        """Determine which months have contributions"""
+        freq = self.contribution_frequency.value
+        return np.arange(0, self.months, 12 // freq)
+    
+    def _run_simulation_no_tax(self) -> np.ndarray:
+        """Run simulation without taxes"""
+        if self.random_seed is not None:
+            np.random.seed(self.random_seed)
+        
+        portfolio_paths = np.zeros((self.num_simulations, self.months + 1))
+        portfolio_paths[:, 0] = self.initial_investment
+        
+        monthly_returns = np.random.normal(
+            self.index_params.monthly_return,
+            self.index_params.monthly_volatility,
+            (self.num_simulations, self.months)
+        )
+        
+        monthly_dividend_rate = self.index_params.dividend_yield / 12
+        
+        for month in range(self.months):
+            portfolio_paths[:, month + 1] = portfolio_paths[:, month] * (1 + monthly_returns[:, month])
+            portfolio_paths[:, month + 1] += portfolio_paths[:, month] * monthly_dividend_rate
+            
+            if month in self.contribution_months:
+                portfolio_paths[:, month + 1] += self.regular_contribution
+        
+        return portfolio_paths
+    
+    def _run_single_path_with_tax(self, monthly_returns: np.ndarray, path_idx: int) -> Tuple[np.ndarray, float]:
+        """Run a single simulation path with tax treatment"""
+        portfolio_values = np.zeros(self.months + 1)
+        portfolio_values[0] = self.initial_investment
+        
+        shares = self.initial_investment
+        price_per_share = 1.0
+        
+        tax_lots: List[TaxLot] = [TaxLot(shares, price_per_share, 0)]
+        loss_carryforward = 0.0
+        total_tax_paid = 0.0
+        dividends_received_ytd = 0.0
+        
+        mtm_tax_basis = self.initial_investment
+        
+        monthly_dividend_rate = self.index_params.dividend_yield / 12
+        
+        for month in range(self.months):
+            price_per_share *= (1 + monthly_returns[month])
+            
+            dividend_income = shares * price_per_share * monthly_dividend_rate
+            dividends_received_ytd += dividend_income
+            
+            new_shares_from_dividends = dividend_income / price_per_share
+            shares += new_shares_from_dividends
+            tax_lots.append(TaxLot(new_shares_from_dividends, price_per_share, month))
+            
+            if month in self.contribution_months:
+                new_shares_from_contribution = self.regular_contribution / price_per_share
+                shares += new_shares_from_contribution
+                tax_lots.append(TaxLot(new_shares_from_contribution, price_per_share, month))
+            
+            portfolio_values[month + 1] = shares * price_per_share
+            
+            current_year = month // 12
+            month_in_year = month % 12
+            
+            if month_in_year == self.tax_settings.tax_payment_month and month > 0:
+                tax_due = 0.0
+                
+                if dividends_received_ytd > 0:
+                    dividend_tax = dividends_received_ytd * self.tax_settings.dividend_tax_rate
+                    tax_due += dividend_tax
+                    dividends_received_ytd = 0.0
+                
+                if self.tax_model == TaxModel.MARK_TO_MARKET:
+                    current_value = shares * price_per_share
+                    unrealized_gain = current_value - mtm_tax_basis
+                    
+                    if unrealized_gain > 0:
+                        taxable_gain = max(0, unrealized_gain - loss_carryforward)
+                        capital_gains_tax = taxable_gain * self.tax_settings.capital_gains_rate
+                        tax_due += capital_gains_tax
+                        
+                        loss_carryforward = max(0, loss_carryforward - unrealized_gain)
+                        mtm_tax_basis = current_value
+                    else:
+                        loss_carryforward += abs(unrealized_gain)
+                        mtm_tax_basis = current_value
+                
+                if tax_due > 0:
+                    shares_to_sell = tax_due / price_per_share
+                    
+                    if shares_to_sell >= shares:
+                        shares_to_sell = shares
+                        tax_due = shares * price_per_share
+                    
+                    if self.tax_model == TaxModel.REALIZATION:
+                        realized_gain = self._sell_shares_fifo(
+                            tax_lots, shares_to_sell, price_per_share
+                        )
+                        
+                        if realized_gain > 0:
+                            taxable_gain = max(0, realized_gain - loss_carryforward)
+                            additional_tax = taxable_gain * self.tax_settings.capital_gains_rate
+                            
+                            if additional_tax > 0:
+                                additional_shares_to_sell = additional_tax / price_per_share
+                                if additional_shares_to_sell < shares:
+                                    shares_to_sell += additional_shares_to_sell
+                                    self._sell_shares_fifo(tax_lots, additional_shares_to_sell, price_per_share)
+                                    tax_due += additional_tax
+                            
+                            loss_carryforward = max(0, loss_carryforward - realized_gain)
+                        else:
+                            loss_carryforward += abs(realized_gain)
+                    else:
+                        self._sell_shares_fifo(tax_lots, shares_to_sell, price_per_share)
+                    
+                    shares -= shares_to_sell
+                    total_tax_paid += tax_due
+                    portfolio_values[month + 1] = shares * price_per_share
+        
+        if self.tax_model == TaxModel.REALIZATION:
+            final_dividend_tax = 0.0
+            if dividends_received_ytd > 0:
+                final_dividend_tax = dividends_received_ytd * self.tax_settings.dividend_tax_rate
+                total_tax_paid += final_dividend_tax
+            
+            final_price = price_per_share
+            final_portfolio_value = shares * final_price
+            
+            realized_gain = self._calculate_total_realized_gain(tax_lots, shares, final_price)
+            
+            final_capital_gains_tax = 0.0
+            if realized_gain > 0:
+                taxable_gain = max(0, realized_gain - loss_carryforward)
+                final_capital_gains_tax = taxable_gain * self.tax_settings.capital_gains_rate
+                total_tax_paid += final_capital_gains_tax
+            
+            portfolio_values[-1] = final_portfolio_value - final_capital_gains_tax - final_dividend_tax
+        
+        return portfolio_values, total_tax_paid
+    
+    def _sell_shares_fifo(self, tax_lots: List[TaxLot], shares_to_sell: float, 
+                          current_price: float) -> float:
+        """Sell shares using FIFO method and return realized gain/loss"""
+        realized_gain = 0.0
+        remaining_to_sell = shares_to_sell
+        
+        lots_to_remove = []
+        
+        for i, lot in enumerate(tax_lots):
+            if remaining_to_sell <= 0:
+                break
+            
+            if lot.shares <= remaining_to_sell:
+                sale_proceeds = lot.shares * current_price
+                cost_basis = lot.shares * lot.cost_basis_per_share
+                realized_gain += (sale_proceeds - cost_basis)
+                remaining_to_sell -= lot.shares
+                lots_to_remove.append(i)
+            else:
+                sale_proceeds = remaining_to_sell * current_price
+                cost_basis = remaining_to_sell * lot.cost_basis_per_share
+                realized_gain += (sale_proceeds - cost_basis)
+                lot.shares -= remaining_to_sell
+                lot.total_cost_basis = lot.shares * lot.cost_basis_per_share
+                remaining_to_sell = 0
+        
+        for i in reversed(lots_to_remove):
+            tax_lots.pop(i)
+        
+        return realized_gain
+    
+    def _calculate_total_realized_gain(self, tax_lots: List[TaxLot], shares_to_sell: float,
+                                       current_price: float) -> float:
+        """Calculate realized gain without modifying tax lots"""
+        realized_gain = 0.0
+        remaining_to_sell = shares_to_sell
+        
+        for lot in tax_lots:
+            if remaining_to_sell <= 0:
+                break
+            
+            shares_from_lot = min(lot.shares, remaining_to_sell)
+            sale_proceeds = shares_from_lot * current_price
+            cost_basis = shares_from_lot * lot.cost_basis_per_share
+            realized_gain += (sale_proceeds - cost_basis)
+            remaining_to_sell -= shares_from_lot
+        
+        return realized_gain
+    
+    def run_simulation(self) -> np.ndarray:
+        """Run the Monte Carlo simulation"""
+        if self.tax_model == TaxModel.NONE:
+            self.portfolio_paths = self._run_simulation_no_tax()
+            self.total_taxes_paid = np.zeros(self.num_simulations)
+        else:
+            if self.random_seed is not None:
+                np.random.seed(self.random_seed)
+            
+            all_returns = np.random.normal(
+                self.index_params.monthly_return,
+                self.index_params.monthly_volatility,
+                (self.num_simulations, self.months)
+            )
+            
+            portfolio_paths = np.zeros((self.num_simulations, self.months + 1))
+            total_taxes = np.zeros(self.num_simulations)
+            
+            for i in range(self.num_simulations):
+                portfolio_paths[i], total_taxes[i] = self._run_single_path_with_tax(
+                    all_returns[i], i
+                )
+            
+            self.portfolio_paths = portfolio_paths
+            self.total_taxes_paid = total_taxes
+        
+        self.final_values = self.portfolio_paths[:, -1]
+        return self.portfolio_paths
+    
+    def get_statistics(self) -> dict:
+        """Calculate summary statistics from the simulation"""
+        if self.final_values is None:
+            raise ValueError("Must run simulation first")
+        
+        total_contributed = (
+            self.initial_investment + 
+            self.regular_contribution * len(self.contribution_months)
+        )
+        
+        stats = {
+            'total_contributed': total_contributed,
+            'mean_final_value': np.mean(self.final_values),
+            'median_final_value': np.median(self.final_values),
+            'percentile_10': np.percentile(self.final_values, 10),
+            'percentile_25': np.percentile(self.final_values, 25),
+            'percentile_75': np.percentile(self.final_values, 75),
+            'percentile_90': np.percentile(self.final_values, 90),
+            'min_value': np.min(self.final_values),
+            'max_value': np.max(self.final_values),
+            'std_dev': np.std(self.final_values)
+        }
+        
+        if self.tax_model != TaxModel.NONE:
+            stats['mean_total_taxes'] = np.mean(self.total_taxes_paid)
+            stats['median_total_taxes'] = np.median(self.total_taxes_paid)
+            stats['total_taxes_10th'] = np.percentile(self.total_taxes_paid, 10)
+            stats['total_taxes_90th'] = np.percentile(self.total_taxes_paid, 90)
+        
+        return stats
 
 
-# Streamlit App Configuration
+# ============================================================================
+# STREAMLIT APP
+# ============================================================================
+
 st.set_page_config(
     page_title="Portfolio Tax Impact Simulator",
     page_icon="📊",
@@ -132,7 +410,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
     <style>
     .main-header {
@@ -148,48 +425,34 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .stButton>button {
-        width: 100%;
-        background-color: #1f77b4;
-        color: white;
-        font-size: 1.1rem;
-        font-weight: bold;
-        border-radius: 10px;
-        padding: 0.75rem;
-    }
     </style>
 """, unsafe_allow_html=True)
 
-# Header
 st.markdown('<p class="main-header">📊 Portfolio Tax Impact Simulator</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Monte Carlo Analysis for Policy Evaluation</p>', unsafe_allow_html=True)
 
-# Sidebar - Input Parameters
+# Sidebar
 st.sidebar.header("⚙️ Simulation Parameters")
 
-# Investment Parameters
 st.sidebar.subheader("💰 Investment Details")
 initial_investment = st.sidebar.number_input(
     "Initial Investment ($)",
     min_value=0,
     value=10000,
-    step=1000,
-    help="Starting portfolio value"
+    step=1000
 )
 
 regular_contribution = st.sidebar.number_input(
     "Regular Contribution Amount ($)",
     min_value=0,
     value=500,
-    step=100,
-    help="Amount contributed each period"
+    step=100
 )
 
 contribution_freq = st.sidebar.selectbox(
     "Contribution Frequency",
     options=["Monthly", "Quarterly", "Annual"],
-    index=0,
-    help="How often contributions are made"
+    index=0
 )
 
 investment_years = st.sidebar.slider(
@@ -197,30 +460,24 @@ investment_years = st.sidebar.slider(
     min_value=5,
     max_value=50,
     value=30,
-    step=1,
-    help="Total investment time horizon"
+    step=1
 )
 
-# Index Selection
 st.sidebar.subheader("📈 Market Index")
 index_options = list(IndexLibrary.get_all_indices().keys())
 selected_index_name = st.sidebar.selectbox(
     "Select Index",
     options=index_options,
-    index=0,
-    help="Choose the market index to simulate"
+    index=0
 )
 
-# Tax Model Selection
 st.sidebar.subheader("🏛️ Taxation Model")
 tax_model_option = st.sidebar.radio(
     "Select Tax Model",
     options=["No Taxes (Baseline)", "Realization-Based", "Mark-to-Market"],
-    index=1,
-    help="Choose how gains are taxed"
+    index=1
 )
 
-# Tax Rates (only show if not "No Taxes")
 if tax_model_option != "No Taxes (Baseline)":
     st.sidebar.subheader("💵 Tax Rates")
     
@@ -229,8 +486,7 @@ if tax_model_option != "No Taxes (Baseline)":
         min_value=0.0,
         max_value=50.0,
         value=20.0,
-        step=0.5,
-        help="Tax rate on capital gains"
+        step=0.5
     ) / 100
     
     dividend_tax_rate = st.sidebar.slider(
@@ -238,37 +494,31 @@ if tax_model_option != "No Taxes (Baseline)":
         min_value=0.0,
         max_value=50.0,
         value=15.0,
-        step=0.5,
-        help="Tax rate on dividend income"
+        step=0.5
     ) / 100
 else:
     capital_gains_rate = 0.0
     dividend_tax_rate = 0.0
 
-# Simulation Settings
 st.sidebar.subheader("🎲 Simulation Settings")
 num_simulations = st.sidebar.select_slider(
     "Number of Simulations",
     options=[100, 500, 1000, 2000, 5000],
-    value=1000,
-    help="More simulations = more accurate but slower"
+    value=1000
 )
 
 random_seed = st.sidebar.number_input(
-    "Random Seed (for reproducibility)",
+    "Random Seed",
     min_value=0,
     value=42,
-    step=1,
-    help="Use same seed for consistent results"
+    step=1
 )
 
-# Run Simulation Button
 st.sidebar.markdown("---")
 run_button = st.sidebar.button("🚀 Run Simulation", type="primary")
 
-# Main Content Area
+# Main content
 if run_button:
-    # Map selections to enums
     freq_map = {
         "Monthly": ContributionFrequency.MONTHLY,
         "Quarterly": ContributionFrequency.QUARTERLY,
@@ -284,11 +534,9 @@ if run_button:
     contribution_frequency = freq_map[contribution_freq]
     tax_model = tax_map[tax_model_option]
     
-    # Get index parameters
     all_indices = IndexLibrary.get_all_indices()
     index_params = all_indices[selected_index_name]
     
-    # Create tax settings if needed
     tax_settings = None
     if tax_model != TaxModel.NONE:
         tax_settings = TaxSettings(
@@ -298,12 +546,7 @@ if run_button:
             cost_basis_method="FIFO"
         )
     
-    # Show progress
-    with st.spinner(f'Running {num_simulations:,} simulations... This may take a minute...'):
-        # NOTE: You need to copy the full PortfolioMonteCarloSimulator class here
-        # or import it from the main module
-        
-        # Create and run simulator
+    with st.spinner(f'Running {num_simulations:,} simulations...'):
         simulator = PortfolioMonteCarloSimulator(
             index_params=index_params,
             initial_investment=initial_investment,
@@ -321,8 +564,7 @@ if run_button:
     
     st.success("✅ Simulation Complete!")
     
-    # Display Results in Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Summary", "📈 Visualizations", "📄 Detailed Report"])
+    tab1, tab2, tab3 = st.tabs(["📊 Summary", "📈 Visualizations", "📄 Report"])
     
     with tab1:
         st.header("Summary Statistics")
@@ -330,10 +572,7 @@ if run_button:
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric(
-                "Total Contributed",
-                f"${stats['total_contributed']:,.0f}"
-            )
+            st.metric("Total Contributed", f"${stats['total_contributed']:,.0f}")
         
         with col2:
             st.metric(
@@ -343,353 +582,33 @@ if run_button:
             )
         
         with col3:
-            st.metric(
-                "Mean Final Value",
-                f"${stats['mean_final_value']:,.0f}",
-                f"${stats['percentile_75']:,.0f}",
-                f"${stats['percentile_90']:,.0f}",
-                f"${stats['max_value']:,.0f}",
-                f"${stats['std_dev']:,.0f}"
-            )
-        
-        
-        st.table(stats_data)
-        
-        if tax_model != TaxModel.NONE:
-            st.subheader("Total Taxes Paid Statistics")
-            
-            tax_stats_data = {
-                "Statistic": [
-                    "10th Percentile",
-                    "Median (50th)",
-                    "Mean",
-                    "90th Percentile"
-                ],
-                "Value ($)": [
-                    f"${stats['total_taxes_10th']:,.0f}",
-                    f"${stats['median_total_taxes']:,.0f}",
-                    f"${stats['mean_total_taxes']:,.0f}",
-                    f"${stats['total_taxes_90th']:,.0f}"
-                ]
-            }
-            
-            st.table(tax_stats_data)
-            
-            st.markdown("---")
-            st.subheader("Tax Impact Summary")
-            
-            # Calculate impact metrics
-            median_final = stats['median_final_value']
-            median_taxes = stats['median_total_taxes']
-            total_contributed = stats['total_contributed']
-            
-            median_growth = median_final + median_taxes - total_contributed
-            tax_percentage = (median_taxes / (median_final + median_taxes)) * 100
-            
-            impact_col1, impact_col2, impact_col3 = st.columns(3)
-            
-            with impact_col1:
-                st.metric("Market Growth (Median)", f"${median_growth:,.0f}")
-            
-            with impact_col2:
-                st.metric("Taxes Paid (Median)", f"${median_taxes:,.0f}")
-            
-            with impact_col3:
-                st.metric("Tax Burden %", f"{tax_percentage:.1f}%")
-            
-            st.info(f"""
-            **Key Insight:** In the median scenario, an investor contributes ${total_contributed:,.0f} 
-            and experiences ${median_growth:,.0f} in market growth. However, ${median_taxes:,.0f} 
-            ({tax_percentage:.1f}% of pre-tax portfolio value) goes to taxes under the {tax_model_option} model, 
-            leaving a final after-tax value of ${median_final:,.0f}.
-            """)
-        
-        # Download report button
-        st.markdown("---")
-        st.subheader("📥 Export Results")
-        
-        # Create downloadable HTML report
-        html_report = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Portfolio Tax Impact Simulation Report</title>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    margin: 40px;
-                    line-height: 1.6;
-                }}
-                h1 {{
-                    color: #1f77b4;
-                    text-align: center;
-                    border-bottom: 3px solid #1f77b4;
-                    padding-bottom: 10px;
-                }}
-                h2 {{
-                    color: #333;
-                    margin-top: 30px;
-                    border-bottom: 2px solid #ddd;
-                    padding-bottom: 5px;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin: 20px 0;
-                }}
-                th, td {{
-                    border: 1px solid #ddd;
-                    padding: 12px;
-                    text-align: left;
-                }}
-                th {{
-                    background-color: #1f77b4;
-                    color: white;
-                }}
-                tr:nth-child(even) {{
-                    background-color: #f2f2f2;
-                }}
-                .summary-box {{
-                    background-color: #e8f4f8;
-                    border-left: 5px solid #1f77b4;
-                    padding: 15px;
-                    margin: 20px 0;
-                }}
-                .metric {{
-                    display: inline-block;
-                    margin: 10px 20px;
-                    padding: 15px;
-                    background-color: #f9f9f9;
-                    border-radius: 5px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }}
-                .metric-value {{
-                    font-size: 24px;
-                    font-weight: bold;
-                    color: #1f77b4;
-                }}
-                .metric-label {{
-                    font-size: 14px;
-                    color: #666;
-                }}
-                @media print {{
-                    body {{
-                        margin: 20px;
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <h1>📊 Portfolio Tax Impact Simulation Report</h1>
-            
-            <div class="summary-box">
-                <h3>Executive Summary</h3>
-                <p>This report presents a Monte Carlo simulation analysis of portfolio growth under the 
-                <strong>{tax_model_option}</strong> taxation model.</p>
-            </div>
-            
-            <h2>Investment Configuration</h2>
-            <table>
-                <tr><th>Parameter</th><th>Value</th></tr>
-                <tr><td>Market Index</td><td>{index_params.name}</td></tr>
-                <tr><td>Initial Investment</td><td>${initial_investment:,.0f}</td></tr>
-                <tr><td>Regular Contribution</td><td>${regular_contribution:,.0f} ({contribution_freq})</td></tr>
-                <tr><td>Investment Period</td><td>{investment_years} years</td></tr>
-                <tr><td>Tax Model</td><td>{tax_model_option}</td></tr>
-                {f'<tr><td>Capital Gains Tax Rate</td><td>{capital_gains_rate*100:.1f}%</td></tr>' if tax_model != TaxModel.NONE else ''}
-                {f'<tr><td>Dividend Tax Rate</td><td>{dividend_tax_rate*100:.1f}%</td></tr>' if tax_model != TaxModel.NONE else ''}
-                <tr><td>Number of Simulations</td><td>{num_simulations:,}</td></tr>
-            </table>
-            
-            <h2>Key Results</h2>
-            <div style="text-align: center;">
-                <div class="metric">
-                    <div class="metric-label">Total Contributed</div>
-                    <div class="metric-value">${stats['total_contributed']:,.0f}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Median Final Value</div>
-                    <div class="metric-value">${stats['median_final_value']:,.0f}</div>
-                </div>
-                <div class="metric">
-                    <div class="metric-label">Mean Final Value</div>
-                    <div class="metric-value">${stats['mean_final_value']:,.0f}</div>
-                </div>
-                {f'''<div class="metric">
-                    <div class="metric-label">Median Taxes Paid</div>
-                    <div class="metric-value">${stats['median_total_taxes']:,.0f}</div>
-                </div>''' if tax_model != TaxModel.NONE else ''}
-            </div>
-            
-            <h2>Final Portfolio Value Statistics</h2>
-            <table>
-                <tr><th>Statistic</th><th>Value</th></tr>
-                <tr><td>Minimum</td><td>${stats['min_value']:,.0f}</td></tr>
-                <tr><td>10th Percentile</td><td>${stats['percentile_10']:,.0f}</td></tr>
-                <tr><td>25th Percentile</td><td>${stats['percentile_25']:,.0f}</td></tr>
-                <tr><td>Median (50th Percentile)</td><td>${stats['median_final_value']:,.0f}</td></tr>
-                <tr><td>Mean</td><td>${stats['mean_final_value']:,.0f}</td></tr>
-                <tr><td>75th Percentile</td><td>${stats['percentile_75']:,.0f}</td></tr>
-                <tr><td>90th Percentile</td><td>${stats['percentile_90']:,.0f}</td></tr>
-                <tr><td>Maximum</td><td>${stats['max_value']:,.0f}</td></tr>
-                <tr><td>Standard Deviation</td><td>${stats['std_dev']:,.0f}</td></tr>
-            </table>
-        """
-        
-        if tax_model != TaxModel.NONE:
-            median_final = stats['median_final_value']
-            median_taxes = stats['median_total_taxes']
-            median_growth = median_final + median_taxes - stats['total_contributed']
-            tax_percentage = (median_taxes / (median_final + median_taxes)) * 100
-            
-            html_report += f"""
-            <h2>Tax Impact Analysis</h2>
-            <table>
-                <tr><th>Statistic</th><th>Value</th></tr>
-                <tr><td>10th Percentile Taxes</td><td>${stats['total_taxes_10th']:,.0f}</td></tr>
-                <tr><td>Median Taxes Paid</td><td>${stats['median_total_taxes']:,.0f}</td></tr>
-                <tr><td>Mean Taxes Paid</td><td>${stats['mean_total_taxes']:,.0f}</td></tr>
-                <tr><td>90th Percentile Taxes</td><td>${stats['total_taxes_90th']:,.0f}</td></tr>
-            </table>
-            
-            <div class="summary-box">
-                <h3>Tax Burden Summary (Median Scenario)</h3>
-                <p><strong>Market Growth:</strong> ${median_growth:,.0f}</p>
-                <p><strong>Taxes Paid:</strong> ${median_taxes:,.0f}</p>
-                <p><strong>Tax Burden:</strong> {tax_percentage:.1f}% of pre-tax portfolio value</p>
-                <p><strong>Final After-Tax Value:</strong> ${median_final:,.0f}</p>
-                <p><strong>Net Gain After Taxes:</strong> ${median_final - stats['total_contributed']:,.0f}</p>
-            </div>
-            """
-        
-        html_report += """
-            <h2>Methodology</h2>
-            <p>This analysis uses Monte Carlo simulation to model portfolio growth under uncertainty. 
-            The simulation:</p>
-            <ul>
-                <li>Models monthly returns using historical mean returns and volatility</li>
-                <li>Includes dividend reinvestment</li>
-                <li>Tracks cost basis using FIFO (First-In-First-Out) method</li>
-                <li>Applies taxation according to the selected model</li>
-                <li>Generates thousands of possible future paths</li>
-            </ul>
-            
-            <h2>Disclaimer</h2>
-            <p><em>This simulation is for educational and policy analysis purposes only. 
-            Past performance does not guarantee future results. Actual investment outcomes may vary 
-            significantly. Consult with financial and tax professionals before making investment decisions.</em></p>
-            
-            <hr>
-            <p style="text-align: center; color: #666; font-size: 12px;">
-                Generated by Portfolio Tax Impact Simulator | Monte Carlo Analysis Tool
-            </p>
-        </body>
-        </html>
-        """
-        
-        # Create download button
-        st.download_button(
-            label="📄 Download HTML Report",
-            data=html_report,
-            file_name=f"portfolio_simulation_report_{tax_model_option.replace(' ', '_').lower()}.html",
-            mime="text/html"
-        )
-
-else:
-    # Show instructions when simulation hasn't been run yet
-    st.info("👈 Configure your simulation parameters in the sidebar and click 'Run Simulation' to begin.")
-    
-    st.markdown("""
-    ## About This Tool
-    
-    This Portfolio Tax Impact Simulator helps policymakers and investors understand how different 
-    taxation models affect long-term investment outcomes.
-    
-    ### Features:
-    - **Monte Carlo Simulation**: Models thousands of possible market scenarios
-    - **Multiple Tax Models**: Compare no taxes, realization-based, and mark-to-market taxation
-    - **Multiple Indices**: Choose from S&P 500, NASDAQ 100, Russell 2000, or MSCI World
-    - **Flexible Parameters**: Customize investment amounts, periods, and contribution frequencies
-    - **Comprehensive Analysis**: View distributions, percentiles, and tax burden metrics
-    - **Exportable Reports**: Download results as HTML for presentations
-    
-    ### Tax Models Explained:
-    
-    **Realization-Based Taxation**
-    - Capital gains are taxed only when shares are sold
-    - Dividends are taxed annually
-    - Allows for tax-deferred growth
-    - Final liquidation event taxes all remaining gains
-    
-    **Mark-to-Market Taxation**
-    - Unrealized gains are taxed annually (as if sold and repurchased)
-    - Dividends are taxed annually
-    - Tax basis steps up each year after taxation
-    - No deferral benefit
-    
-    ### How to Use:
-    1. Set your investment parameters (amount, frequency, period)
-    2. Choose a market index
-    3. Select a taxation model and set tax rates
-    4. Adjust simulation settings (number of paths, random seed)
-    5. Click "Run Simulation"
-    6. Review results in the three tabs
-    7. Download HTML report for sharing
-    """)
-    
-    st.markdown("---")
-    st.markdown("**Note:** Before running the simulation, make sure you have copied the full "
-                "`PortfolioMonteCarloSimulator` class into this file where indicated in the code.")
-
-
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("""
-<div style="text-align: center; font-size: 0.8rem; color: #666;">
-    <p><strong>Portfolio Tax Impact Simulator</strong></p>
-    <p>Monte Carlo Analysis Tool</p>
-    <p>For policy evaluation purposes</p>
-</div>
-"""
-            )
+            st.metric("Mean Final Value", f"${stats['mean_final_value']:,.0f}")
         
         with col4:
             if tax_model != TaxModel.NONE:
-                st.metric(
-                    "Median Taxes Paid",
-                    f"${stats['median_total_taxes']:,.0f}"
-                )
+                st.metric("Median Taxes", f"${stats['median_total_taxes']:,.0f}")
             else:
-                st.metric(
-                    "Tax Model",
-                    "None"
-                )
+                st.metric("Tax Model", "None")
         
-        # Percentile ranges
         st.subheader("Final Portfolio Value Ranges")
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.info(f"**10th Percentile (Pessimistic)**\n\n${stats['percentile_10']:,.0f}")
+            st.info(f"**10th Percentile**\n\n${stats['percentile_10']:,.0f}")
         
         with col2:
-            st.success(f"**50th Percentile (Median)**\n\n${stats['median_final_value']:,.0f}")
+            st.success(f"**Median**\n\n${stats['median_final_value']:,.0f}")
         
         with col3:
-            st.warning(f"**90th Percentile (Optimistic)**\n\n${stats['percentile_90']:,.0f}")
+            st.warning(f"**90th Percentile**\n\n${stats['percentile_90']:,.0f}")
     
     with tab2:
         st.header("Visual Analysis")
         
-        # Generate plots
-        st.subheader("Portfolio Growth Simulation")
-        
-        # Create figure for portfolio paths
         fig1, ax = plt.subplots(figsize=(12, 6))
         
         time_years = np.linspace(0, investment_years, simulator.months + 1)
         
-        # Show sample paths
         num_paths_to_show = min(100, num_simulations)
         indices_to_plot = np.random.choice(num_simulations, size=num_paths_to_show, replace=False)
         
@@ -697,7 +616,6 @@ st.sidebar.markdown("""
             ax.plot(time_years, simulator.portfolio_paths[idx], 
                    alpha=0.1, color='blue', linewidth=0.5)
         
-        # Percentile lines
         p10 = np.percentile(simulator.portfolio_paths, 10, axis=0)
         p50 = np.percentile(simulator.portfolio_paths, 50, axis=0)
         p90 = np.percentile(simulator.portfolio_paths, 90, axis=0)
@@ -714,7 +632,6 @@ st.sidebar.markdown("""
         
         st.pyplot(fig1)
         
-        # Distribution plots
         col1, col2 = st.columns(2)
         
         with col1:
@@ -723,7 +640,7 @@ st.sidebar.markdown("""
             ax2.hist(simulator.final_values, bins=50, alpha=0.7, color='green', edgecolor='black')
             ax2.axvline(np.median(simulator.final_values), color='red', linestyle='--',
                        linewidth=2, label=f'Median: ${np.median(simulator.final_values):,.0f}')
-            ax2.set_xlabel('Final Portfolio Value ($)')
+            ax2.set_xlabel('Final Value ($)')
             ax2.set_ylabel('Frequency')
             ax2.legend()
             ax2.grid(True, alpha=0.3, axis='y')
@@ -736,17 +653,15 @@ st.sidebar.markdown("""
                 ax3.hist(simulator.total_taxes_paid, bins=50, alpha=0.7, color='red', edgecolor='black')
                 ax3.axvline(np.median(simulator.total_taxes_paid), color='darkred', linestyle='--',
                            linewidth=2, label=f'Median: ${np.median(simulator.total_taxes_paid):,.0f}')
-                ax3.set_xlabel('Total Taxes Paid ($)')
+                ax3.set_xlabel('Total Taxes ($)')
                 ax3.set_ylabel('Frequency')
                 ax3.legend()
                 ax3.grid(True, alpha=0.3, axis='y')
                 st.pyplot(fig3)
         
-        # Tax Impact Summary (if applicable)
         if tax_model != TaxModel.NONE:
             st.subheader("Tax Impact Analysis")
             
-            # Prepare data for impact chart
             total_contributed = stats['total_contributed']
             
             median_final = np.median(simulator.final_values)
@@ -761,10 +676,8 @@ st.sidebar.markdown("""
             p90_taxes = np.percentile(simulator.total_taxes_paid, 90)
             p90_growth = p90_final + p90_taxes - total_contributed
             
-            # Create impact visualization
             fig4, (ax4, ax5) = plt.subplots(1, 2, figsize=(14, 5))
             
-            # Stacked bar chart
             scenarios = ['10th\nPercentile', 'Median', '90th\nPercentile']
             contributions = [total_contributed] * 3
             growth = [p10_growth, median_growth, p90_growth]
@@ -785,7 +698,6 @@ st.sidebar.markdown("""
             ax4.legend()
             ax4.grid(True, alpha=0.3, axis='y')
             
-            # Tax percentage chart
             percentages = [
                 (p10_taxes / (p10_final + p10_taxes)) * 100,
                 (median_taxes / (median_final + median_taxes)) * 100,
@@ -808,47 +720,20 @@ st.sidebar.markdown("""
             st.pyplot(fig4)
     
     with tab3:
-        st.header("Detailed Statistical Report")
+        st.header("Detailed Report")
         
-        st.subheader("Investment Configuration")
+        st.subheader("Configuration")
         config_col1, config_col2 = st.columns(2)
         
         with config_col1:
             st.write(f"**Index:** {index_params.name}")
             st.write(f"**Initial Investment:** ${initial_investment:,.0f}")
             st.write(f"**Regular Contribution:** ${regular_contribution:,.0f}")
-            st.write(f"**Contribution Frequency:** {contribution_freq}")
-            st.write(f"**Investment Period:** {investment_years} years")
+            st.write(f"**Frequency:** {contribution_freq}")
+            st.write(f"**Period:** {investment_years} years")
         
         with config_col2:
             st.write(f"**Tax Model:** {tax_model_option}")
             if tax_model != TaxModel.NONE:
                 st.write(f"**Capital Gains Rate:** {capital_gains_rate*100:.1f}%")
-                st.write(f"**Dividend Tax Rate:** {dividend_tax_rate*100:.1f}%")
-            st.write(f"**Number of Simulations:** {num_simulations:,}")
-            st.write(f"**Random Seed:** {random_seed}")
-        
-        st.markdown("---")
-        
-        st.subheader("Final Portfolio Value Statistics")
-        
-        stats_data = {
-            "Statistic": [
-                "Total Contributed",
-                "Minimum",
-                "10th Percentile",
-                "25th Percentile",
-                "Median (50th)",
-                "Mean",
-                "75th Percentile",
-                "90th Percentile",
-                "Maximum",
-                "Standard Deviation"
-            ],
-            "Value ($)": [
-                f"${stats['total_contributed']:,.0f}",
-                f"${stats['min_value']:,.0f}",
-                f"${stats['percentile_10']:,.0f}",
-                f"${stats['percentile_25']:,.0f}",
-                f"${stats['median_final_value']:,.0f}",
-                f"${stats['mean_final_value']:,.0
+                st.write(f"**Dividend Rate:** {dividend_tax_rate*100:.1f}%")
