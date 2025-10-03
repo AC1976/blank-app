@@ -650,7 +650,7 @@ st.sidebar.markdown("""
     <p>Monte Carlo Analysis Tool</p>
     <p>For policy evaluation purposes</p>
 </div>
-""", unsafe_allow_html=True)f}"
+""", unsafe_allow_html=True)"
             )
         
         with col4:
